@@ -1,3 +1,4 @@
+
 const axios = require('axios');
 const { nocodb } = require('./config');
 const { TABLES } = require('./schema');
@@ -15,7 +16,7 @@ const http = axios.create({
    student/admin even though the very next attempt would have worked.
    This wraps every NocoDB call so a single transient failure gets
    retried a couple of times with a short backoff before giving up. */
-async function withRetry(fn, attempts = 3) {
+async function withRetry(fn, attempts = 5) {
   let lastErr;
   for (let i = 0; i < attempts; i++) {
     try {
@@ -23,9 +24,15 @@ async function withRetry(fn, attempts = 3) {
     } catch (e) {
       lastErr = e;
       const status = e.response?.status;
-      const retriable = !status || status === 429 || status >= 500 || e.code === 'ECONNRESET' || e.code === 'ECONNABORTED' || e.code === 'ETIMEDOUT';
+      const isThrottle = status === 420 || status === 429;
+      const retriable = !status || isThrottle || status >= 500 || e.code === 'ECONNRESET' || e.code === 'ECONNABORTED' || e.code === 'ETIMEDOUT';
       if (!retriable || i === attempts - 1) throw e;
-      await new Promise((r) => setTimeout(r, 300 * (i + 1))); // 300ms, 600ms, ...
+      // Throttle responses (420/429) need a much longer cooldown than a
+      // plain network hiccup, or the very next retry just gets throttled
+      // again — NocoDB Cloud's free-tier rate limit resets on the order
+      // of seconds, not milliseconds.
+      const delay = isThrottle ? 2000 * (i + 1) : 300 * (i + 1);
+      await new Promise((r) => setTimeout(r, delay));
     }
   }
   throw lastErr;
@@ -136,12 +143,18 @@ async function findOrCreateTable(tableName, columns) {
 async function ensureAllTables(manualBaseId) {
   await findOrCreateBase(manualBaseId);
   const failed = [];
-  for (const [name, columns] of Object.entries(TABLES)) {
+  const tableNames = Object.entries(TABLES);
+  for (let i = 0; i < tableNames.length; i++) {
+    const [name, columns] = tableNames[i];
     try {
       await findOrCreateTable(name, columns);
     } catch (e) {
       failed.push({ table: name, error: e.response?.data || e.message });
     }
+    // Small gap between tables — spreads out the burst of meta-API calls
+    // so we're less likely to hit NocoDB Cloud's rate limit in the first
+    // place (rather than only reacting to it after the fact via retries).
+    if (i < tableNames.length - 1) await new Promise((r) => setTimeout(r, 400));
   }
   if (failed.length) {
     const err = new Error(
