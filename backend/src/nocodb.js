@@ -1,3 +1,4 @@
+
 const axios = require('axios');
 const { nocodb } = require('./config');
 const { TABLES } = require('./schema');
@@ -8,14 +9,6 @@ const http = axios.create({
   timeout: 30000,
 });
 
-/* ---------------- global request serializer ----------------
-   NocoDB Cloud's free tier throttles (420/429) if calls come in too
-   fast, even a few hundred ms apart. Rather than just adding gaps in
-   one place (boot), every single NocoDB HTTP call in this whole file
-   funnels through this one queue — so at any given moment, across the
-   entire app, only ONE request to NocoDB is ever in flight, each
-   spaced MIN_GAP_MS apart. This is the single point of control for
-   "one table/request at a time". */
 const MIN_GAP_MS = 500;
 let queueTail = Promise.resolve();
 let lastCallAt = 0;
@@ -26,18 +19,11 @@ function enqueue(fn) {
     lastCallAt = Date.now();
     return fn();
   };
-  const result = queueTail.then(run, run); // run next in line even if the previous call failed
-  queueTail = result.catch(() => {}); // never let one failure break the chain for later calls
+  const result = queueTail.then(run, run);
+  queueTail = result.catch(() => {});
   return result;
 }
 
-/* ---------------- resilience: retry transient failures ----------------
-   NocoDB (like any network service) occasionally hiccups — a dropped
-   connection, a 429 (rate limited), a brief 502/503 while it's busy.
-   Without a retry, any one of those turns into a visible error for the
-   student/admin even though the very next attempt would have worked.
-   This wraps every NocoDB call so a single transient failure gets
-   retried a couple of times with a short backoff before giving up. */
 async function withRetry(fn, attempts = 6) {
   let lastErr;
   for (let i = 0; i < attempts; i++) {
@@ -49,10 +35,6 @@ async function withRetry(fn, attempts = 6) {
       const isThrottle = status === 420 || status === 429;
       const retriable = !status || isThrottle || status >= 500 || e.code === 'ECONNRESET' || e.code === 'ECONNABORTED' || e.code === 'ETIMEDOUT';
       if (!retriable || i === attempts - 1) throw e;
-      // Throttle responses (420/429) need a much longer cooldown than a
-      // plain network hiccup, or the very next retry just gets throttled
-      // again — NocoDB Cloud's free-tier rate limit resets on the order
-      // of seconds, not milliseconds.
       const delay = isThrottle ? 2500 * (i + 1) : 300 * (i + 1);
       await new Promise((r) => setTimeout(r, delay));
     }
@@ -60,20 +42,9 @@ async function withRetry(fn, attempts = 6) {
   throw lastErr;
 }
 
-// In-memory cache of NocoDB's internal ids for our base + each table,
-// so we hit the Meta API once at boot instead of on every request.
 let baseId = null;
 const tableIdByName = {};
 
-/* ---------------- per-table read cache (mirrors the original
-   Apps-Script CACHE_TTL_ idea) ----------------
-   Tables that barely change (course/content structure) are cached
-   longer — far fewer NocoDB round-trips under normal browsing load.
-   Tables that change fast or gate security (OTPs, Attempts,
-   Purchases) get a short TTL so nothing stale-serves past what's
-   safe. Every write to a table invalidates that table's cache entry
-   immediately, so a save/delete is always reflected on the very next
-   read — this is a speed layer, never a staleness risk beyond its TTL. */
 const CACHE_TTL_MS = {
   Courses: 30000, Subjects: 30000, Topics: 30000, Lectures: 30000, Books: 30000, FreeCourses: 30000,
   PaymentSettings: 60000, Admins: 20000, AdminLogs: 20000, Bills: 15000,
@@ -82,14 +53,11 @@ const CACHE_TTL_MS = {
   PerfSummary: 5000,
   default: 8000,
 };
-const rowCache = new Map(); // tableName -> { data, expiresAt }
+const rowCache = new Map();
 
 function cacheGet(tableName) {
   const entry = rowCache.get(tableName);
   if (entry && entry.expiresAt > Date.now()) {
-    // Deep-clone on the way out — callers sometimes mutate a row object
-    // in place before saving it back; that must never corrupt the
-    // shared cached copy other requests are also reading.
     return JSON.parse(JSON.stringify(entry.data));
   }
   return null;
@@ -103,17 +71,13 @@ function invalidateCache(tableName) {
 }
 
 async function findOrCreateBase(manualBaseId) {
-  // If we already know the base ID (env var, or passed in manually), use it
-  // directly. NocoDB Cloud's fine-grained tokens frequently can't list/create
-  // bases via /api/v2/meta/bases even with "Base" permission granted, so
-  // skipping that call entirely avoids the ERR_FORBIDDEN it triggers.
   const known = (manualBaseId || nocodb.baseId || '').trim();
   if (known) {
     console.log(`[nocodb] Using known base ID from config/param: "${known}" — skipping base list/create.`);
     baseId = known;
     return baseId;
   }
-  console.log('[nocodb] No baseId configured — falling back to /api/v2/meta/bases list/create (this is the call that returns ERR_FORBIDDEN on many NocoDB Cloud accounts). Set NOCODB_BASE_ID to avoid this.');
+  console.log('[nocodb] No baseId configured — falling back to /api/v2/meta/bases list/create.');
   const { data } = await withRetry(() => http.get('/api/v2/meta/bases'));
   const list = data.list || [];
   let base = list.find((b) => b.title === nocodb.baseName);
@@ -139,9 +103,6 @@ async function findOrCreateTable(tableName, columns) {
     }));
     table = res.data;
   } else {
-    // Migration: add any columns that exist in schema.js but not yet
-    // in this NocoDB table (mirrors the original ensureTable_ behaviour
-    // of appending missing headers without touching existing ones).
     const { data: full } = await withRetry(() => http.get(`/api/v2/meta/tables/${table.id}`));
     const existingCols = (full.columns || []).map((c) => c.title);
     const missing = columns.filter((c) => existingCols.indexOf(c) === -1);
@@ -152,18 +113,13 @@ async function findOrCreateTable(tableName, columns) {
           title: col,
           uidt: 'SingleLineText',
         }));
-      } catch (e) {
-        // best-effort — don't fail boot over one column
-      }
+      } catch (e) {}
     }
   }
   tableIdByName[tableName] = table.id;
   return table.id;
 }
 
-// Call once at startup. Creates the base + every table in schema.js
-// if they don't already exist. Safe to call again any time (e.g. a
-// 'linkDatabase' action re-running it) — it's all idempotent.
 async function ensureAllTables(manualBaseId) {
   await findOrCreateBase(manualBaseId);
   const failed = [];
@@ -200,9 +156,6 @@ function tableId(name) {
   return id;
 }
 
-// Strips NocoDB's internal Id / system fields from a record so the
-// shape returned to the frontend matches the original Sheets rows
-// exactly (only the columns declared in schema.js).
 function toPlainRow(record, columns) {
   const obj = {};
   columns.forEach((c) => {
@@ -220,7 +173,6 @@ async function getAllRows(tableName) {
   let offset = 0;
   const limit = 1000;
   const rows = [];
-  // NocoDB paginates; loop until pageInfo says we've read everything.
   for (;;) {
     const { data } = await withRetry(() => http.get(`/api/v2/tables/${id}/records`, {
       params: { limit, offset },
@@ -235,10 +187,6 @@ async function getAllRows(tableName) {
   return rows;
 }
 
-// Finds the NocoDB internal record (with its numeric Id) matching
-// keyCol=keyVal — needed to PATCH/DELETE a specific row. Always a
-// live lookup (never cached) since saveRow/deleteRow need the exact
-// current Id right before writing.
 async function findRecordRaw(tableName, keyCol, keyVal) {
   const id = tableId(tableName);
   const where = `(${keyCol},eq,${String(keyVal).replace(/[()]/g, '')})`;
@@ -249,7 +197,6 @@ async function findRecordRaw(tableName, keyCol, keyVal) {
   return list[0] || null;
 }
 
-// Upsert: update the row if keyCol already exists, else insert.
 async function saveRow(tableName, keyCol, row) {
   const id = tableId(tableName);
   const existing = row[keyCol] !== undefined && row[keyCol] !== '' && row[keyCol] !== null
@@ -264,8 +211,6 @@ async function saveRow(tableName, keyCol, row) {
   return true;
 }
 
-// Always inserts a new row, never updates — for append-only logs
-// (AdminLogs, Attempts, OTPs, Purchases, Feedbacks, Doubts, ...).
 async function appendRow(tableName, row) {
   const id = tableId(tableName);
   await withRetry(() => http.post(`/api/v2/tables/${id}/records`, row));
