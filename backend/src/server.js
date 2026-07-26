@@ -7,7 +7,7 @@ const { route } = require('./actions');
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '25mb' })); // base64 file uploads ride in the JSON body
+app.use(express.json({ limit: '25mb', type: () => true })); // base64 file uploads ride in the JSON body
 
 fs.mkdirSync(uploads.dir, { recursive: true });
 app.use('/uploads', express.static(uploads.dir));
